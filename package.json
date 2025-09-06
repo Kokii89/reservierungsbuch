@@ -2,14 +2,15 @@
   "name": "reservierungsbuch",
   "version": "0.1.0",
   "private": true,
-  {
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev --turbopack",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "lint": "next lint"
   },
-  "packageManager": "pnpm@9"
-}
+  "packageManager": "pnpm@9",
+  "engines": {
+    "node": ">=18.17"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.0",

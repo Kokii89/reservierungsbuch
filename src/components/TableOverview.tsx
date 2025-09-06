@@ -413,8 +413,8 @@ async function handleAction(
       if (t.status === "FREE") {
         next = "SEATED";
         nextSince = Date.now();
-        name = null;
-        partySize = null;
+        name = undefined;
+        partySize = undefined;
         note = undefined;
         reservedFor = null; // geplante Zeit ist für Walk-in irrelevant
       }
