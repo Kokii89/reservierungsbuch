@@ -1,14 +1,21 @@
 "use client";
-import React, { useMemo, useState, useEffect } from "react";
+import React, { useMemo, useState, useEffect, useRef } from "react";
 import { supabase } from "@/lib/supabase";
+import { toISO, cls } from "@/utils/tableHelpers";
+import {
+  Table,
+  TableStatus,
+  Reservation,
+  MenuItem,
+} from "@/types/restaurant";
+import ReservationBook from "@/components/ReservationBook";
+import TableCard from "@/components/TableCard";
+import OrderModal from "@/components/OrderModal";
+import { getOrCreateOpenOrder, loadOpenOrderData } from "@/lib/ordersService";
 
 /* =========================
-   Helpers & Konstanten
+  Konstanten
    ========================= */
-
-   // Helper: egal ob number (ms) oder string -> immer ISO oder null
-const toISO = (v: number | string | null | undefined) =>
-  v ? new Date(v as any).toISOString() : null;
 
 const STATUS_META = {
   FREE: { label: "Frei", badge: "FREE" },
@@ -16,17 +23,6 @@ const STATUS_META = {
   SEATED: { label: "Belegt", badge: "IN" },
   DIRTY: { label: "Reinigung", badge: "DIRTY" },
 } as const;
-
-type TableStatus = keyof typeof STATUS_META;
-
-// Typ für Einträge im Reservierungsbuch
-type Reservation = {
-  id: string;        // z.B. Date.now() als String
-  name: string;
-  partySize: number;
-  time: string;      // "HH:MM" (heute)
-  tableId?: string;  // gesetzt, wenn zugewiesen
-};
 
 // DB -> UI
 const fromRow = (r: any) => ({
@@ -52,38 +48,26 @@ const toRow = (t: Table) => ({
   note: t.note ?? null,
 });
 
+
 const RES_BOOK_KEY = "reservation-book-v1"; // localStorage-Key fürs Buch
 
-const statusOrder: TableStatus[] = ["SEATED", "RESERVED", "DIRTY", "FREE"];
+function compareTableIds(a: string, b: string) {
+  const matchA = a.match(/^(.*?)(\d+)$/);
+  const matchB = b.match(/^(.*?)(\d+)$/);
 
-function since(ts?: number | string | null) {
-  if (!ts) return "–";
-  const d = Date.now() - new Date(ts).getTime();
-  const mins = Math.floor(d / 60000);
-  if (mins < 1) return "<1m";
-  if (mins < 60) return `${mins}m`;
-  const h = Math.floor(mins / 60);
-  const m = mins % 60;
-  return `${h}h ${m}m`;
+  if (matchA && matchB) {
+    const prefixA = matchA[1];
+    const prefixB = matchB[1];
+    if (prefixA !== prefixB) return prefixA.localeCompare(prefixB);
+
+    const numA = Number(matchA[2]);
+    const numB = Number(matchB[2]);
+    return numA - numB;
+  }
+
+  return a.localeCompare(b);
 }
 
-function formatTime(ts?: number | string | null) {
-  if (ts === null || typeof ts === "undefined") return "";
-  const d = new Date(ts as any);
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
-}
-
-function minutesSince(ts?: number | string | null) {
-  if (!ts) return 0;
-  const d = Date.now() - new Date(ts).getTime();
-  return Math.floor(d / 60000);
-}
-
-function cls(...parts: Array<string | false | null | undefined>) {
-  return parts.filter(Boolean).join(" ");
-}
 
 const statusColor = (s: TableStatus) => {
   switch (s) {
@@ -125,16 +109,6 @@ const capacityOverrides: Record<string, number> = {
   // "T1": 2, "T4": 6,
 };
 
-type Table = {
-  id: string;
-  capacity: number;
-  status: TableStatus;
-  name?: string;
-  partySize?: number;
-  since: number | string | null;
-  note?: string;
-  reservedFor?: number | string | null;
-};
 
 const defaultTables: Table[] = Array.from({ length: DEFAULT_TABLE_COUNT }, (_, i) => {
   const id = `T${i + 1}`;
@@ -151,7 +125,7 @@ const STORAGE_KEY = "table-overview-v3"; // neuer Key -> alte Caches stören nic
 export default function TableOverview({ tables: externalTables }: { tables?: Table[] }) {
   // --- State ---
   const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<TableStatus | "ALL">("ALL");
+  const [activeView, setActiveView] = useState<"TABLES" | "RESERVATIONS">("TABLES");
   const [tick, setTick] = useState(0); // refresht "Seit: ..."
   const [localTables, setLocalTables] = useState<Table[]>(() => {
     if (typeof window === "undefined") return defaultTables;
@@ -227,19 +201,161 @@ const [reservations, setReservations] = useState<Reservation[]>(() => {
 const [rbName, setRbName]   = useState("");
 const [rbParty, setRbParty] = useState<number>(2);
 const [rbTime, setRbTime]   = useState<string>("18:00");
+const [loadingTables, setLoadingTables] = useState(true);
+const [loadingReservations, setLoadingReservations] = useState(true);
+const [backendWaking, setBackendWaking] = useState(false);
+const [menu, setMenu] = useState<MenuItem[]>([]);
+const [openOrdersTotal, setOpenOrdersTotal] = useState<Record<string, number>>({});
+const [orderModalFor, setOrderModalFor] = useState<Table | null>(null);
+const [basket, setBasket] = useState<Record<string, number>>({});
+const [loadedBasket, setLoadedBasket] = useState<Record<string, number>>({});
+const [itemCache, setItemCache] = useState<Record<string, MenuItem>>({});
+const [plu, setPlu] = useState("");
+const [pluQty, setPluQty] = useState<number>(1);
+const pluInputRef = useRef<HTMLInputElement | null>(null);
+useEffect(() => {
+  if (!orderModalFor) return;
+  const timer = window.setTimeout(() => {
+    pluInputRef.current?.focus();
+    pluInputRef.current?.select();
+  }, 0);
+  return () => window.clearTimeout(timer);
+}, [orderModalFor]);
+const orderTableCacheRef = useRef<Record<string, string>>({});
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function runWithRetry<T>(
+  label: string,
+  task: () => Promise<any>,
+  attempts = 3,
+  delayMs = 1500
+) {
+  let lastError: any = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const result = await task();
+    if (!result.error) {
+      if (attempt > 1) setBackendWaking(false);
+      return result;
+    }
+
+    lastError = result.error;
+    console.warn(`${label} failed (attempt ${attempt}/${attempts})`, result.error);
+
+    if (attempt < attempts) {
+      setBackendWaking(true);
+      await sleep(delayMs);
+    }
+  }
+
+  setBackendWaking(false);
+  throw lastError;
+}
+async function updateQtyAndPersist(itemId: string, q: number) {
+  if (!orderModalFor) return;
+
+  const nextBasket = { ...basket };
+  if (q <= 0) delete nextBasket[itemId];
+  else nextBasket[itemId] = q;
+
+  setBasket(nextBasket);
+
+  try {
+    const orderId = await getOrCreateOpenOrder(orderModalFor.id);
+orderTableCacheRef.current[orderId] = orderModalFor.id;
+    await syncBasketToOrder(orderId, nextBasket);
+    await loadOpenOrderIntoModal(orderModalFor.id);
+    await refreshTotals([orderModalFor.id]);
+  } catch (e) {
+    console.error(e);
+    alert("Konnte Bestellposition nicht aktualisieren.");
+  }
+}
+
+async function refreshTotalForTable(tableId: string) {
+  if (!tableId) return;
+
+  const { data: ords } = await supabase
+    .from("orders")
+    .select("id")
+    .eq("table_id", tableId)
+    .eq("status", "OPEN")
+    .limit(1);
+
+  const orderId = ords?.[0]?.id ?? null;
+  if (!orderId) {
+    setOpenOrdersTotal((prev) => ({ ...prev, [tableId]: 0 }));
+    return;
+  }
+
+  orderTableCacheRef.current[orderId] = tableId;
+
+  const { data: items } = await supabase
+    .from("order_items")
+    .select("qty, price_cents")
+    .eq("order_id", orderId);
+
+  const total = (items ?? []).reduce(
+    (sum, it: any) => sum + it.qty * it.price_cents,
+    0
+  );
+
+  setOpenOrdersTotal((prev) => ({
+    ...prev,
+    [tableId]: total,
+  }));
+}
+
+async function refreshTotals(tableIds: string[]) {
+  const uniqueIds = Array.from(new Set(tableIds)).filter(Boolean);
+  if (!uniqueIds.length) return;
+  await Promise.all(uniqueIds.map((tableId) => refreshTotalForTable(tableId)));
+}
+
+async function resolveTableIdForOrder(orderId: string) {
+  const cached = orderTableCacheRef.current[orderId];
+  if (cached) return cached;
+
+  const { data: orderRow } = await supabase
+    .from("orders")
+    .select("table_id")
+    .eq("id", orderId)
+    .single();
+
+  const tableId = orderRow?.table_id as string | undefined;
+  if (tableId) {
+    orderTableCacheRef.current[orderId] = tableId;
+  }
+  return tableId;
+}
+
+useEffect(() => {
+  const ids = (localTables ?? []).map((t) => t.id);
+  if (!ids.length) return;
+
+  const missingIds = ids.filter((id) => !(id in openOrdersTotal));
+  if (missingIds.length) {
+    void refreshTotals(missingIds);
+  }
+}, [localTables, openOrdersTotal]);
 
   // --- Effects ---
-  // 1) Ticker + Auto-Storno (RESERVED > 30 min ab reservedFor -> FREE + note)
+// 1) Ticker + Auto-Storno (RESERVED > 30 min ab reservedFor -> FREE + note)
+// Supabase wake-up ping
+useEffect(() => {
+  void supabase.from("tables").select("id").limit(1);
+}, []);
+
 useEffect(() => {
   const id = setInterval(async () => {
     setTick((t) => t + 1);
 
     const due = localTables.filter((tbl) => {
-  if (tbl.status !== "RESERVED" || !tbl.reservedFor) return false;
-  const tms = new Date(tbl.reservedFor as any).getTime();
-  return tms > 0 && (Date.now() - tms) / 60000 >= 30;
-});
-
+      if (tbl.status !== "RESERVED" || !tbl.reservedFor) return false;
+      const tms = new Date(tbl.reservedFor as any).getTime();
+      return tms > 0 && (Date.now() - tms) / 60000 >= 30;
+    });
     // in DB freigeben
     for (const tbl of due) {
       await supabase.from("tables").update({
@@ -254,20 +370,49 @@ useEffect(() => {
   return () => clearInterval(id);
 }, [localTables]);
 
+useEffect(() => {
+  (async () => {
+    try {
+      const { data } = await runWithRetry(
+        "Supabase load menu",
+        () =>
+          supabase
+            .from("menu_items")
+            .select("*")
+            .eq("active", true)
+            .order("name", { ascending: true })
+      );
+      if (data) setMenu(data as MenuItem[]);
+    } catch (error) {
+      console.error("Supabase load menu error:", error);
+    }
+  })();
+}, []);
+
 // Initial: Tische laden
 useEffect(() => {
   (async () => {
-    const { data, error } = await supabase
-      .from("tables")
-      .select("*")
-      .order("id", { ascending: true });
+    setLoadingTables(true);
+    try {
+      const { data } = await runWithRetry(
+        "Supabase load tables",
+        () => supabase.from("tables").select("*").order("id", { ascending: true })
+      );
 
-    if (error) {
-      console.error("Supabase load tables error:", error);
-      return;
-    }
-    if (data) {
-      setLocalTables(data.map(fromRow));
+      if (data) {
+        setLocalTables((data as any[]).map(fromRow));
+      }
+    } catch (error) {
+      console.error("Supabase load tables error:", {
+        message: error?.message,
+        details: error?.details,
+        hint: error?.hint,
+        code: error?.code,
+        full: error,
+      });
+    } finally {
+      setLoadingTables(false);
+      setBackendWaking(false);
     }
   })();
 }, []);
@@ -294,7 +439,7 @@ useEffect(() => {
             if (i >= 0) next[i] = obj;
             else next.push(obj);
           }
-          next.sort((a, b) => a.id.localeCompare(b.id));
+          next.sort((a, b) => compareTableIds(a.id, b.id));
           return next;
         });
       }
@@ -309,24 +454,34 @@ useEffect(() => {
 // Initial: Reservierungen laden
 useEffect(() => {
   (async () => {
-    const { data, error } = await supabase
-      .from("reservations")
-      .select("*")
-      .order("time", { ascending: true });
-
-    if (error) {
-      console.error("Supabase load reservations error:", error);
-      return;
-    }
-    if (data) {
-      setReservations(
-        data.map((r: any) => ({
-          id: r.id,
-          name: r.name,
-          partySize: r.party_size,
-          time: r.time, // ISO-Zeitstempel oder timestamptz -> du zeigst ihn formatiert
-        }))
+    setLoadingReservations(true);
+    try {
+      const { data } = await runWithRetry(
+        "Supabase load reservations",
+        () => supabase.from("reservations").select("*").order("time", { ascending: true })
       );
+
+      if (data) {
+        setReservations(
+          (data as any[]).map((r: any) => ({
+            id: r.id,
+            name: r.name,
+            partySize: r.party_size,
+            time: r.time,
+          }))
+        );
+      }
+    } catch (error) {
+      console.error("Supabase load reservations error:", {
+        message: error?.message,
+        details: error?.details,
+        hint: error?.hint,
+        code: error?.code,
+        full: error,
+      });
+    } finally {
+      setLoadingReservations(false);
+      setBackendWaking(false);
     }
   })();
 }, []);
@@ -368,21 +523,77 @@ useEffect(() => {
   };
 }, []);
 
+// Realtime: offene Orders / Summen auf allen Geräten aktualisieren
+useEffect(() => {
+  const ch = supabase
+    .channel("orders-realtime")
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "orders" },
+      async (payload) => {
+        const row = (payload.new ?? payload.old) as any;
+        const tableId = row?.table_id as string | undefined;
+        const orderId = row?.id as string | undefined;
+
+        if (tableId && orderId) {
+          orderTableCacheRef.current[orderId] = tableId;
+        }
+
+        if (tableId) {
+          await refreshTotalForTable(tableId);
+        }
+
+        if (orderModalFor?.id && tableId === orderModalFor.id) {
+          await loadOpenOrderIntoModal(orderModalFor.id);
+        }
+      }
+    )
+    .subscribe();
+
+  return () => {
+    supabase.removeChannel(ch);
+  };
+}, [orderModalFor]);
+
+useEffect(() => {
+  const ch = supabase
+    .channel("order-items-realtime")
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "order_items" },
+      async (payload) => {
+        const row = (payload.new ?? payload.old) as any;
+        const orderId = row?.order_id as string | undefined;
+
+        if (!orderId) return;
+
+        const tableId = await resolveTableIdForOrder(orderId);
+        if (tableId) {
+          await refreshTotalForTable(tableId);
+        }
+
+        if (orderModalFor?.id && tableId === orderModalFor.id) {
+          await loadOpenOrderIntoModal(orderModalFor.id);
+        }
+      }
+    )
+    .subscribe();
+
+  return () => {
+    supabase.removeChannel(ch);
+  };
+}, [orderModalFor]);
+
   // --- Abgeleitete Werte ---
   const tables = externalTables?.length ? externalTables : localTables;
 
   const filtered = useMemo(() => {
     return tables
-      .filter((t) => (filter === "ALL" ? true : t.status === filter))
       .filter((t) =>
         query ? `${t.id} ${t.name ?? ""}`.toLowerCase().includes(query.toLowerCase()) : true
       )
-      .sort(
-        (a, b) =>
-          statusOrder.indexOf(a.status) - statusOrder.indexOf(b.status) ||
-          a.id.localeCompare(b.id)
-      );
-  }, [tables, filter, query, tick]);
+      .sort((a, b) => compareTableIds(a.id, b.id));
+  }, [tables, query, tick]);
 
   const totals = useMemo(() => {
     const res: Record<string, number> = { ALL: tables.length };
@@ -514,82 +725,246 @@ async function handleAction(
   }
 }
 
+
+
+  async function syncBasketToOrder(orderId: string, desiredBasket: Record<string, number>) {
+    const { data: existingRows, error } = await supabase
+      .from("order_items")
+      .select("id, item_id, qty, price_cents")
+      .eq("order_id", orderId);
+
+    if (error) throw error;
+
+    const rows = (existingRows ?? []) as Array<{
+      id: string;
+      item_id: string;
+      qty: number;
+      price_cents: number;
+    }>;
+
+    const grouped: Record<string, Array<{ id: string; qty: number; price_cents: number }>> = {};
+    rows.forEach((row) => {
+      if (!grouped[row.item_id]) grouped[row.item_id] = [];
+      grouped[row.item_id].push({ id: row.id, qty: row.qty, price_cents: row.price_cents });
+    });
+
+    const allItemIds = Array.from(
+      new Set([...Object.keys(grouped), ...Object.keys(desiredBasket)])
+    );
+
+    for (const itemId of allItemIds) {
+      const desiredQty = desiredBasket[itemId] ?? 0;
+      const currentRows = grouped[itemId] ?? [];
+      const currentQty = currentRows.reduce((sum, row) => sum + row.qty, 0);
+
+      if (desiredQty > currentQty) {
+        const delta = desiredQty - currentQty;
+        const item = itemCache[itemId] || menu.find((m) => m.id === itemId);
+        if (!item) throw new Error(`Artikel ${itemId} nicht gefunden`);
+
+        const { error: insertErr } = await supabase.from("order_items").insert({
+          order_id: orderId,
+          item_id: item.id,
+          qty: delta,
+          price_cents: item.price_cents,
+        });
+        if (insertErr) throw insertErr;
+      }
+
+      if (desiredQty < currentQty) {
+        let removeNeeded = currentQty - desiredQty;
+
+        for (const row of currentRows) {
+          if (removeNeeded <= 0) break;
+
+          if (row.qty <= removeNeeded) {
+            const { error: deleteErr } = await supabase
+              .from("order_items")
+              .delete()
+              .eq("id", row.id);
+            if (deleteErr) throw deleteErr;
+            removeNeeded -= row.qty;
+          } else {
+            const { error: updateErr } = await supabase
+              .from("order_items")
+              .update({ qty: row.qty - removeNeeded })
+              .eq("id", row.id);
+            if (updateErr) throw updateErr;
+            removeNeeded = 0;
+          }
+        }
+      }
+    }
+  }
+
+  async function addPluToBasket() {
+    if (!orderModalFor) return;
+
+    const code = plu.trim();
+    const qty = Math.max(1, Number(pluQty) || 1);
+
+    if (!code) return;
+
+    const { data, error } = await supabase
+      .from("menu_items")
+      .select("*")
+      .eq("plu", code)
+      .eq("active", true)
+      .single();
+
+    if (error || !data) {
+      alert("PLU nicht gefunden oder inaktiv.");
+      return;
+    }
+
+    const item = data as MenuItem;
+
+    const nextBasket = {
+      ...basket,
+      [item.id]: (basket[item.id] ?? 0) + qty,
+    };
+
+    setItemCache((prev) => ({
+      ...prev,
+      [item.id]: item,
+    }));
+    setBasket(nextBasket);
+
+    try {
+      const orderId = await getOrCreateOpenOrder(orderModalFor.id);
+      orderTableCacheRef.current[orderId] = orderModalFor.id;
+      await syncBasketToOrder(orderId, nextBasket);
+      await loadOpenOrderIntoModal(orderModalFor.id);
+      setPlu("");
+      setPluQty(1);
+      await refreshTotals([orderModalFor.id]);
+    } catch (e) {
+      console.error(e);
+      alert("Konnte Artikel nicht speichern.");
+    }
+  }
+
+  async function loadOpenOrderIntoModal(tableId: string) {
+    try {
+      const { basket, menuRows } = await loadOpenOrderData(tableId);
+
+      setBasket(basket);
+      setLoadedBasket(basket);
+
+      const cache: Record<string, MenuItem> = {};
+      menuRows.forEach((row) => {
+        cache[row.id] = row;
+      });
+      setItemCache(cache);
+    } catch (err) {
+      console.error(err);
+      setBasket({});
+      setLoadedBasket({});
+      setItemCache({});
+    }
+  }
+
+    
+
+  function closeOrderModal() {
+    setOrderModalFor(null);
+    setBasket({});
+    setLoadedBasket({});
+    setItemCache({});
+    setPlu("");
+    setPluQty(1);
+  }
+
+  async function handleCheckout() {
+    if (!orderModalFor) return;
+
+    const confirmed = window.confirm("Tisch wirklich abrechnen und abschließen?");
+    if (!confirmed) return;
+
+    const orderId = await getOrCreateOpenOrder(orderModalFor.id);
+    orderTableCacheRef.current[orderId] = orderModalFor.id;
+    await syncBasketToOrder(orderId, basket);
+
+    await supabase
+      .from("orders")
+      .update({ status: "PAID", closed_at: new Date().toISOString() })
+      .eq("id", orderId);
+
+    const { data: remainingOpen } = await supabase
+      .from("orders")
+      .select("id")
+      .eq("table_id", orderModalFor.id)
+      .eq("status", "OPEN");
+
+    if (remainingOpen && remainingOpen.length > 0) {
+      for (const openOrder of remainingOpen) {
+        await supabase
+          .from("orders")
+          .update({ status: "CANCELLED", closed_at: new Date().toISOString() })
+          .eq("id", openOrder.id);
+      }
+    }
+
+    await handleAction(orderModalFor, "CHECKOUT");
+    closeOrderModal();
+    await refreshTotals([orderModalFor.id]);
+  }
+
   /* =========================
      Render
      ========================= */
 
   return (
-
     <div className="p-4 md:p-6 lg:p-8 space-y-4">
-      {/* Header */}
-      <section className="space-y-3">
-  <h2 className="text-xl font-semibold">Reservierungsbuch</h2>
-
-  {/* Erfassungsformular */}
-  <div className="flex flex-wrap items-end gap-2">
-    <label className="text-sm">Name
-      <input className="mt-1 border rounded px-2 py-1 block"
-             value={rbName} onChange={(e)=>setRbName(e.target.value)} />
-    </label>
-    <label className="text-sm">Personen
-      <input type="number" min={1} className="mt-1 border rounded px-2 py-1 block w-20"
-             value={rbParty} onChange={(e)=>setRbParty(Number(e.target.value))} />
-    </label>
-    <label className="text-sm">Uhrzeit
-      <input type="time" className="mt-1 border rounded px-2 py-1 block"
-             value={rbTime} onChange={(e)=>setRbTime(e.target.value)} />
-    </label>
-    <button onClick={addReservationToBook}
-            className="px-3 py-2 text-sm rounded bg-blue-600 text-white hover:bg-blue-700">
-      Hinzufügen
-    </button>
-  </div>
-
-  {/* Liste offener Reservierungen */}
-  <div className="overflow-x-auto">
-    <table className="min-w-full text-sm border-separate border-spacing-y-2">
-      <thead className="text-xs opacity-70">
-        <tr><th className="text-left">Zeit</th><th>Name</th><th>Pers.</th><th>Zuweisen</th><th/></tr>
-      </thead>
-      <tbody>
-        {[...reservations].sort((a,b)=>a.time.localeCompare(b.time)).map(r => {
-          const candidates = tables.filter(t => t.status==="FREE");
-          return (
-            <tr key={r.id} className="align-middle">
-              <td className="py-1 pr-4 opacity-80">{r.time}</td>
-              <td className="py-1 pr-4">{r.name}</td>
-              <td className="py-1 pr-4">{r.partySize}</td>
-              <td className="py-1 pr-4">
-                <div className="flex items-center gap-2">
-                  <select id={`sel-${r.id}`} className="border rounded px-2 py-1">
-                    {candidates.length===0 && <option>Keine frei</option>}
-                    {candidates.map(t => (
-                      <option key={t.id} value={t.id}>{t.id} (Kap {t.capacity})</option>
-                    ))}
-                  </select>
-                  <button
-                    className="px-2 py-1 text-xs rounded bg-green-600 text-white hover:bg-green-700"
-                    disabled={candidates.length===0}
-                    onClick={() => {
-                      const sel = document.getElementById(`sel-${r.id}`) as HTMLSelectElement | null;
-                      const tableId = sel?.value;
-                      if (tableId) assignReservationToTable(r.id, tableId);
-                    }}
-                  >Zuweisen</button>
-                </div>
-              </td>
-              <td className="py-1">
-                <button className="px-2 py-1 text-xs rounded border hover:bg-white/10"
-                        onClick={()=>removeReservation(r.id)}>Löschen</button>
-              </td>
-            </tr>
-          );
-        })}
-      </tbody>
-    </table>
-  </div>
-</section>
-      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+      {(loadingTables || loadingReservations || backendWaking) && (
+        <div className="rounded-xl border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-200">
+          {backendWaking
+            ? "Supabase wird gerade aufgeweckt. Bitte kurz warten ..."
+            : "Daten werden geladen ..."}
+        </div>
+      )}
+      <div className="flex items-center gap-2">
+        <button
+          className={cls(
+            "px-3 py-2 rounded-xl border text-sm",
+            activeView === "TABLES"
+              ? "bg-white text-black border-white"
+              : "bg-transparent text-white border-white/20"
+          )}
+          onClick={() => setActiveView("TABLES")}
+        >
+          Tische
+        </button>
+        <button
+          className={cls(
+            "px-3 py-2 rounded-xl border text-sm",
+            activeView === "RESERVATIONS"
+              ? "bg-white text-black border-white"
+              : "bg-transparent text-white border-white/20"
+          )}
+          onClick={() => setActiveView("RESERVATIONS")}
+        >
+          Reservierungen
+        </button>
+      </div>
+      {activeView === "RESERVATIONS" && (
+        <ReservationBook
+          reservations={reservations}
+          tables={tables}
+          rbName={rbName}
+          rbParty={rbParty}
+          rbTime={rbTime}
+          setRbName={setRbName}
+          setRbParty={setRbParty}
+          setRbTime={setRbTime}
+          addReservationToBook={addReservationToBook}
+          assignReservationToTable={assignReservationToTable}
+          removeReservation={removeReservation}
+        />
+      )}
+      {activeView === "TABLES" && (
+        <>
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
         <h1 className="text-2xl font-semibold">Tisch-Übersicht</h1>
         <div className="flex items-center gap-2">
           <input
@@ -598,18 +973,6 @@ async function handleAction(
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
-          <select
-            className="border rounded-xl px-3 py-2"
-            value={filter}
-            onChange={(e) => setFilter((e.target.value as TableStatus | "ALL") ?? "ALL")}
-          >
-            <option value="ALL">Alle</option>
-            {(Object.keys(STATUS_META) as TableStatus[]).map((s) => (
-              <option key={s} value={s}>
-                {STATUS_META[s].label}
-              </option>
-            ))}
-          </select>
 
         </div>
       </div>
@@ -625,131 +988,53 @@ async function handleAction(
 
       {/* Grid */}
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
-        {filtered.map((t) => {
-          // Timer-Highlights
-        const mins = minutesSince(t.since);
-       const resMs = t.reservedFor ? new Date(t.reservedFor as any).getTime() : 0;
-const minsToRes = resMs ? Math.floor((Date.now() - resMs) / 60000) : 0;
-        const warnReserved   = t.status === "RESERVED" && t.reservedFor && minsToRes >= 20 && minsToRes < 30;
-        const overdueReserved = t.status === "RESERVED" && t.reservedFor && minsToRes >= 30;
-        const longSeated = t.status === "SEATED" && mins >= 90;
-        const ringCls = overdueReserved
-            ? "ring-2 ring-red-400"
-            : warnReserved
-            ? "ring-2 ring-yellow-300"
-            : longSeated
-            ? "ring-2 ring-yellow-400"
-            : "";
-          return (
-            <div
-              key={t.id}
-              className={cls(
-                "rounded-2xl border p-3 shadow-sm hover:shadow-md transition",
-                statusColor(t.status),
-                ringCls
-              )}
-            >
-              <div className="flex items-center justify-between">
-      <div className="font-semibold">{t.id}</div>
-      <div className="flex flex-col items-end">
-      <div className="text-xs opacity-70">{STATUS_META[t.status]?.badge}</div>
-        {t.status === "SEATED" && (
-      <div className="text-sm font-bold mt-1">
-        ⏱ {since(t.since)}
-      </div>
-    )}
-      </div>
+        {filtered.map((t) => (
+          <TableCard
+            key={t.id}
+            table={t}
+            statusMeta={STATUS_META}
+            statusColor={statusColor}
+            openOrdersTotal={openOrdersTotal}
+            onSeatNow={(table) => handleAction(table, "SEAT_NOW")}
+            onCheckIn={(table) => handleAction(table, "CHECKIN")}
+            onCancel={(table) => handleAction(table, "CANCEL")}
+            onOpenOrder={async (table) => {
+              setOrderModalFor(table);
+              setPlu("");
+              setPluQty(1);
+              await loadOpenOrderIntoModal(table.id);
+            }}
+            onClean={(table) => handleAction(table, "CLEAN")}
+          />
+        ))}
       </div>
 
-{t.name && (
-  <div className="mt-2 text-sm opacity-80">{t.name}</div>
-)}
-{t.partySize && (
-  <div className="mt-1 text-xs opacity-60">{t.partySize} Pers.</div>
-)}
-
-              {t.note && <div className="mt-1 text-xs italic opacity-70">{t.note}</div>}
-
-{t.status === "RESERVED" && t.reservedFor ? (
-  <div className="mt-2 text-xs opacity-80">
-    Reserviert für: {formatTime(t.reservedFor)}
-  </div>
-) : (
-  <div className="mt-2 text-xs opacity-60">Seit: {since(t.since)}</div>
-)}
-{warnReserved && (
-  <div className="mt-1 text-xs text-yellow-300 font-semibold">
-    Gast verspätet
-  </div>
-)}
-
-{overdueReserved && (
-  <div className="mt-1 text-xs text-red-300 font-semibold">
-    No-Show (30m+)
-  </div>
-)}
-
-{longSeated && (
-  <div className="mt-1 text-xs text-yellow-300 font-semibold">
-    Tisch &gt; 90m belegt
-  </div>
-)}
-              {/* Aktionsleiste */}
-              <div className="mt-2 flex flex-wrap gap-1">
-                {t.status === "FREE" && (
-                  <>
-                    <button
-                      onClick={() => handleAction(t, "SEAT_NOW")}
-                      className="px-2 py-1 text-xs rounded bg-green-600 text-white hover:bg-green-700">
-                      Gäste platzieren
-                    </button>
-                  </>
-                )}
-                {t.status === "RESERVED" && (
-                  <>
-                    <button
-                      onClick={() => handleAction(t, "CHECKIN")}
-                      className="px-2 py-1 text-xs rounded bg-green-600 text-white hover:bg-green-700"
-                    >
-                      Check-in
-                    </button>
-                    <button
-                      onClick={() => handleAction(t, "CANCEL")}
-                      className="px-2 py-1 text-xs rounded bg-gray-600 text-white hover:bg-gray-700"
-                    >
-                      Stornieren
-                    </button>
-                  </>
-                )}
-
-                {t.status === "SEATED" && (
-                  <button
-                    onClick={() => handleAction(t, "CHECKOUT")}
-                    className="px-2 py-1 text-xs rounded bg-red-600 text-white hover:bg-red-700"
-                  >
-                    Checkout
-                  </button>
-                )}
-
-                {t.status === "DIRTY" && (
-                  <button
-                    onClick={() => handleAction(t, "CLEAN")}
-                    className="px-2 py-1 text-xs rounded bg-blue-600 text-white hover:bg-blue-700"
-                  >
-                    Reinigen
-                  </button>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
+      {/* Order Modal */}
+      {orderModalFor && (
+        <OrderModal
+          orderModalFor={orderModalFor}
+          basket={basket}
+          itemCache={itemCache}
+          menu={menu}
+          plu={plu}
+          pluQty={pluQty}
+          pluInputRef={pluInputRef}
+          setPlu={setPlu}
+          setPluQty={setPluQty}
+          addPluToBasket={addPluToBasket}
+          updateQtyAndPersist={updateQtyAndPersist}
+          onClose={closeOrderModal}
+          onCheckout={handleCheckout}
+        />
+      )}
 
       {/* Footer */}
-      <div className="pt-2 text-sm opacity-80">
-        Gesamt: {totals.ALL} · Frei: {totals.FREE} · Reserviert: {totals.RESERVED} ·{" "}
-        Belegt: {totals.SEATED} · Reinigung: {totals.DIRTY}
-      </div>
+          <div className="pt-2 text-sm opacity-80">
+            Gesamt: {totals.ALL} · Frei: {totals.FREE} · Reserviert: {totals.RESERVED} ·{" "}
+            Belegt: {totals.SEATED} · Reinigung: {totals.DIRTY}
+          </div>
+        </>
+      )}
     </div>
   );
-}
+} 
