@@ -227,7 +227,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function runWithRetry<T>(
   label: string,
-  task: () => Promise<any>,
+  task: () => any,
   attempts = 3,
   delayMs = 1500
 ) {
