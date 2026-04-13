@@ -402,7 +402,7 @@ useEffect(() => {
       if (data) {
         setLocalTables((data as any[]).map(fromRow));
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error("Supabase load tables error:", {
         message: error?.message,
         details: error?.details,
@@ -471,7 +471,7 @@ useEffect(() => {
           }))
         );
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error("Supabase load reservations error:", {
         message: error?.message,
         details: error?.details,
