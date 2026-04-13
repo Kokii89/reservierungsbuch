@@ -8,9 +8,9 @@
     "start": "next start",
     "lint": "next lint"
   },
-  "packageManager": "pnpm@9",
+  "packageManager": "pnpm@10.28.0",
   "engines": {
-    "node": ">=18.17"
+    "node": "22.x"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.0",
