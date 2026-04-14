@@ -1,5 +1,7 @@
-import { supabase } from "@/lib/supabase";
+import { createClient } from "@/lib/supabase/client";
 import { MenuItem } from "@/types/restaurant";
+
+const supabase = createClient();
 
 export async function getOrCreateOpenOrder(tableId: string): Promise<string> {
   const { data: exist, error: existErr } = await supabase
@@ -15,7 +17,7 @@ export async function getOrCreateOpenOrder(tableId: string): Promise<string> {
     const keepId = exist[0].id as string;
 
     if (exist.length > 1) {
-      const duplicateIds = exist.slice(1).map((o) => o.id);
+      const duplicateIds = exist.slice(1).map((o: any) => o.id);
       for (const duplicateId of duplicateIds) {
         await supabase
           .from("orders")

@@ -1,6 +1,6 @@
 "use client";
 import React, { useMemo, useState, useEffect, useRef } from "react";
-import { supabase } from "@/lib/supabase";
+import { createClient as createSupabaseClient } from "@/lib/supabase/client";
 import { toISO, cls } from "@/utils/tableHelpers";
 import {
   Table,
@@ -126,6 +126,8 @@ export default function TableOverview({ tables: externalTables }: { tables?: Tab
   // --- State ---
   const [query, setQuery] = useState("");
   const [activeView, setActiveView] = useState<"TABLES" | "RESERVATIONS">("TABLES");
+  const [currentUsername, setCurrentUsername] = useState("");
+  const [currentRole, setCurrentRole] = useState("");
   const [tick, setTick] = useState(0); // refresht "Seit: ..."
   const [localTables, setLocalTables] = useState<Table[]>(() => {
     if (typeof window === "undefined") return defaultTables;
@@ -222,6 +224,39 @@ useEffect(() => {
   return () => window.clearTimeout(timer);
 }, [orderModalFor]);
 const orderTableCacheRef = useRef<Record<string, string>>({});
+const supabase = createSupabaseClient();
+useEffect(() => {
+  (async () => {
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
+      window.location.href = "/login";
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("staff_profiles")
+      .select("username, role, active")
+      .eq("id", user.id)
+      .single();
+
+    if (error) {
+      console.error("Failed to load staff profile:", error);
+      return;
+    }
+
+    if (data?.active === false) {
+      await supabase.auth.signOut();
+      window.location.href = "/login";
+      return;
+    }
+
+    setCurrentUsername(data?.username ?? user.email ?? "");
+    setCurrentRole(data?.role ?? "");
+  })();
+}, []);
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -297,7 +332,7 @@ async function refreshTotalForTable(tableId: string) {
     .eq("order_id", orderId);
 
   const total = (items ?? []).reduce(
-    (sum, it: any) => sum + it.qty * it.price_cents,
+    (sum: number, it: any) => sum + it.qty * it.price_cents,
     0
   );
 
@@ -424,7 +459,7 @@ useEffect(() => {
     .on(
       "postgres_changes",
       { event: "*", schema: "public", table: "tables" },
-      (payload) => {
+      (payload: any) => {
         const row = (payload.new ?? payload.old) as any;
         if (!row?.id) return;
 
@@ -493,7 +528,7 @@ useEffect(() => {
     .on(
       "postgres_changes",
       { event: "*", schema: "public", table: "reservations" },
-      (payload) => {
+      (payload: any) => {
         const row = (payload.new ?? payload.old) as any;
         if (!row?.id) return;
 
@@ -530,7 +565,7 @@ useEffect(() => {
     .on(
       "postgres_changes",
       { event: "*", schema: "public", table: "orders" },
-      async (payload) => {
+      async (payload: any) => {
         const row = (payload.new ?? payload.old) as any;
         const tableId = row?.table_id as string | undefined;
         const orderId = row?.id as string | undefined;
@@ -561,7 +596,7 @@ useEffect(() => {
     .on(
       "postgres_changes",
       { event: "*", schema: "public", table: "order_items" },
-      async (payload) => {
+      async (payload: any) => {
         const row = (payload.new ?? payload.old) as any;
         const orderId = row?.order_id as string | undefined;
 
@@ -910,6 +945,11 @@ async function handleAction(
     await refreshTotals([orderModalFor.id]);
   }
 
+  async function handleLogout() {
+    await supabase.auth.signOut();
+    window.location.href = "/login";
+  }
+
   /* =========================
      Render
      ========================= */
@@ -923,29 +963,44 @@ async function handleAction(
             : "Daten werden geladen ..."}
         </div>
       )}
-      <div className="flex items-center gap-2">
-        <button
-          className={cls(
-            "px-3 py-2 rounded-xl border text-sm",
-            activeView === "TABLES"
-              ? "bg-white text-black border-white"
-              : "bg-transparent text-white border-white/20"
-          )}
-          onClick={() => setActiveView("TABLES")}
-        >
-          Tische
-        </button>
-        <button
-          className={cls(
-            "px-3 py-2 rounded-xl border text-sm",
-            activeView === "RESERVATIONS"
-              ? "bg-white text-black border-white"
-              : "bg-transparent text-white border-white/20"
-          )}
-          onClick={() => setActiveView("RESERVATIONS")}
-        >
-          Reservierungen
-        </button>
+      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div className="flex items-center gap-2">
+          <button
+            className={cls(
+              "px-3 py-2 rounded-xl border text-sm",
+              activeView === "TABLES"
+                ? "bg-white text-black border-white"
+                : "bg-transparent text-white border-white/20"
+            )}
+            onClick={() => setActiveView("TABLES")}
+          >
+            Tische
+          </button>
+          <button
+            className={cls(
+              "px-3 py-2 rounded-xl border text-sm",
+              activeView === "RESERVATIONS"
+                ? "bg-white text-black border-white"
+                : "bg-transparent text-white border-white/20"
+            )}
+            onClick={() => setActiveView("RESERVATIONS")}
+          >
+            Reservierungen
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2 text-sm">
+          <div className="px-3 py-2 rounded-xl border border-white/20 bg-white/5">
+            {currentUsername || "Benutzer"}
+            {currentRole ? ` · ${currentRole}` : ""}
+          </div>
+          <button
+            className="px-3 py-2 rounded-xl border border-red-400/40 text-red-200 hover:bg-red-500/10"
+            onClick={() => void handleLogout()}
+          >
+            Logout
+          </button>
+        </div>
       </div>
       {activeView === "RESERVATIONS" && (
         <ReservationBook
