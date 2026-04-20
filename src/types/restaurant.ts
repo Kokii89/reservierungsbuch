@@ -25,6 +25,7 @@ export type MenuItem = {
   price_cents: number;
   active: boolean;
   plu?: string | null;
+  category?: string;
 };
 
 export type Order = {

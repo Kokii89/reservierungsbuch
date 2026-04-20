@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useMemo, useState } from "react";
 import { MenuItem, Table } from "@/types/restaurant";
 import { formatPrice } from "@/utils/tableHelpers";
 
@@ -16,6 +16,7 @@ type Props = {
   updateQtyAndPersist: (itemId: string, q: number) => Promise<void>;
   onClose: () => void;
   onCheckout: () => Promise<void>;
+  onPrintKitchenBon: () => void | Promise<void>;
 };
 
 export default function OrderModal({
@@ -32,8 +33,38 @@ export default function OrderModal({
   updateQtyAndPersist,
   onClose,
   onCheckout,
+  onPrintKitchenBon,
 }: Props) {
   if (!orderModalFor) return null;
+
+  const [search, setSearch] = useState("");
+  const [activeCategory, setActiveCategory] = useState<string>("all");
+
+  const categories = useMemo(() => {
+    const unique = Array.from(
+      new Set(menu.map((item) => item.category).filter(Boolean))
+    ) as string[];
+
+    return ["all", ...unique];
+  }, [menu]);
+
+  const filteredMenu = useMemo(() => {
+    const query = search.trim().toLowerCase();
+
+    return menu.filter((item) => {
+      const matchesCategory =
+        activeCategory === "all" || item.category === activeCategory;
+
+      const matchesSearch =
+        !query ||
+        item.name.toLowerCase().includes(query) ||
+        String(item.plu ?? "")
+          .toLowerCase()
+          .includes(query);
+
+      return matchesCategory && matchesSearch && item.active;
+    });
+  }, [menu, search, activeCategory]);
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
@@ -42,35 +73,106 @@ export default function OrderModal({
           Bestellung – {orderModalFor.id}
         </h2>
 
-        <div className="flex items-end gap-2 mb-4">
-          <label className="text-sm">
-            PLU
-            <input
-              ref={pluInputRef}
-              className="mt-1 border rounded px-2 py-1 block w-32"
-              value={plu}
-              onChange={(e) => setPlu(e.target.value)}
-              placeholder="z. B. 101"
-            />
-          </label>
+        <div className="mb-4 rounded-lg border p-3 space-y-3">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+            <label className="text-sm">
+              PLU
+              <input
+                ref={pluInputRef}
+                className="mt-1 border rounded px-2 py-1 block w-32"
+                value={plu}
+                onChange={(e) => setPlu(e.target.value)}
+                placeholder="z. B. 101"
+              />
+            </label>
 
-          <label className="text-sm">
-            Menge
-            <input
-              type="number"
-              min={1}
-              className="mt-1 border rounded px-2 py-1 block w-20"
-              value={pluQty}
-              onChange={(e) => setPluQty(Math.max(1, Number(e.target.value) || 1))}
-            />
-          </label>
+            <label className="text-sm">
+              Menge
+              <input
+                type="number"
+                min={1}
+                className="mt-1 border rounded px-2 py-1 block w-20"
+                value={pluQty}
+                onChange={(e) => setPluQty(Math.max(1, Number(e.target.value) || 1))}
+              />
+            </label>
 
-          <button
-            className="px-3 py-2 text-sm rounded bg-blue-600 text-white hover:bg-blue-700"
-            onClick={addPluToBasket}
-          >
-            Artikel hinzufügen
-          </button>
+            <button
+              className="px-3 py-2 text-sm rounded bg-blue-600 text-white hover:bg-blue-700"
+              onClick={addPluToBasket}
+            >
+              Artikel hinzufügen
+            </button>
+          </div>
+
+          <div className="border-t pt-3 space-y-3">
+            <label className="text-sm block">
+              Suche nach Name oder PLU
+              <input
+                className="mt-1 border rounded px-2 py-2 block w-full"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="z. B. Udon, Cola, 1105"
+              />
+            </label>
+
+            <div className="flex gap-2 overflow-x-auto pb-1">
+              {categories.map((category) => {
+                const active = activeCategory === category;
+                return (
+                  <button
+                    key={category}
+                    type="button"
+                    className={`shrink-0 rounded-full px-3 py-1 text-sm border ${
+                      active
+                        ? "bg-black text-white border-black"
+                        : "bg-white text-black border-gray-300"
+                    }`}
+                    onClick={() => setActiveCategory(category)}
+                  >
+                    {category === "all" ? "Alle" : category}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="max-h-56 overflow-auto rounded-lg border">
+              {filteredMenu.length === 0 ? (
+                <div className="p-3 text-sm opacity-70">
+                  Keine Artikel gefunden.
+                </div>
+              ) : (
+                <div className="divide-y">
+                  {filteredMenu.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      className="w-full text-left p-3 hover:bg-gray-50"
+                      onClick={() => {
+                        setPlu(String(item.plu ?? ""));
+                        setSearch(item.name);
+                        if (pluInputRef.current) {
+                          pluInputRef.current.focus();
+                        }
+                      }}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="font-medium break-words">{item.name}</div>
+                          <div className="text-xs opacity-70 mt-1">
+                            PLU {item.plu} • {item.category ?? "ohne Kategorie"}
+                          </div>
+                        </div>
+                        <div className="shrink-0 text-sm font-medium">
+                          {formatPrice(item.price_cents)}
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
 
         <div className="space-y-2">
@@ -150,6 +252,13 @@ export default function OrderModal({
         <div className="mt-3 flex justify-end gap-2">
           <button className="px-3 py-1 text-sm rounded border" onClick={onClose}>
             Schließen
+          </button>
+
+          <button
+            className="px-3 py-1 text-sm rounded bg-blue-600 text-white hover:bg-blue-700"
+            onClick={() => void onPrintKitchenBon()}
+          >
+            Bon drucken
           </button>
 
           <button

@@ -950,6 +950,50 @@ async function handleAction(
     window.location.href = "/login";
   }
 
+  async function printKitchenItems(
+    tableLabel: string,
+    items: Array<{ name: string; qty: number; category?: string }>
+  ) {
+    try {
+      await fetch("/api/print", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          table: tableLabel,
+          items,
+        }),
+      });
+    } catch (error) {
+      console.error("Kitchen print failed:", error);
+    }
+  }
+
+  async function printCurrentKitchenBon() {
+    if (!orderModalFor) return;
+
+    const printableItems = Object.entries(basket)
+      .map(([itemId, qty]) => {
+        const item = itemCache[itemId];
+        if (!item || qty <= 0) return null;
+
+        return {
+          name: item.name,
+          qty,
+          category: item.category,
+        };
+      })
+      .filter(Boolean) as Array<{ name: string; qty: number; category?: string }>;
+
+    if (printableItems.length === 0) {
+      alert("Keine Artikel zum Drucken.");
+      return;
+    }
+
+    await printKitchenItems(orderModalFor.id, printableItems);
+  }
+
   /* =========================
      Render
      ========================= */
@@ -1080,6 +1124,7 @@ async function handleAction(
           updateQtyAndPersist={updateQtyAndPersist}
           onClose={closeOrderModal}
           onCheckout={handleCheckout}
+          onPrintKitchenBon={printCurrentKitchenBon}
         />
       )}
 

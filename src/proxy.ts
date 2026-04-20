@@ -2,13 +2,15 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
 export function proxy(req: NextRequest) {
-  const isLoginPage = req.nextUrl.pathname === "/login";
+  const pathname = req.nextUrl.pathname;
+  const isLoginPage = pathname === "/login";
+  const isPrintApi = pathname === "/api/print";
 
   const hasSupabaseCookie = req.cookies
     .getAll()
     .some((cookie) => cookie.name.startsWith("sb-"));
 
-  if (!hasSupabaseCookie && !isLoginPage) {
+  if (!hasSupabaseCookie && !isLoginPage && !isPrintApi) {
     return NextResponse.redirect(new URL("/login", req.url));
   }
 
