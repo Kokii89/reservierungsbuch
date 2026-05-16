@@ -209,8 +209,10 @@ const [backendWaking, setBackendWaking] = useState(false);
 const [menu, setMenu] = useState<MenuItem[]>([]);
 const [openOrdersTotal, setOpenOrdersTotal] = useState<Record<string, number>>({});
 const [orderModalFor, setOrderModalFor] = useState<Table | null>(null);
+const [moveTargetTableId, setMoveTargetTableId] = useState("");
 const [basket, setBasket] = useState<Record<string, number>>({});
 const [loadedBasket, setLoadedBasket] = useState<Record<string, number>>({});
+const [itemNotes, setItemNotes] = useState<Record<string, string>>({});
 const [itemCache, setItemCache] = useState<Record<string, MenuItem>>({});
 const [plu, setPlu] = useState("");
 const [pluQty, setPluQty] = useState<number>(1);
@@ -765,7 +767,7 @@ async function handleAction(
   async function syncBasketToOrder(orderId: string, desiredBasket: Record<string, number>) {
     const { data: existingRows, error } = await supabase
       .from("order_items")
-      .select("id, item_id, qty, price_cents")
+      .select("id, item_id, qty, price_cents, printed_qty, note")
       .eq("order_id", orderId);
 
     if (error) throw error;
@@ -775,12 +777,14 @@ async function handleAction(
       item_id: string;
       qty: number;
       price_cents: number;
+      printed_qty: number;
+      note: string | null;
     }>;
 
-    const grouped: Record<string, Array<{ id: string; qty: number; price_cents: number }>> = {};
+    const grouped: Record<string, Array<{ id: string; qty: number; price_cents: number; printed_qty: number }>> = {};
     rows.forEach((row) => {
       if (!grouped[row.item_id]) grouped[row.item_id] = [];
-      grouped[row.item_id].push({ id: row.id, qty: row.qty, price_cents: row.price_cents });
+      grouped[row.item_id].push({ id: row.id, qty: row.qty, price_cents: row.price_cents, printed_qty: row.printed_qty ?? 0 });
     });
 
     const allItemIds = Array.from(
@@ -802,6 +806,7 @@ async function handleAction(
           item_id: item.id,
           qty: delta,
           price_cents: item.price_cents,
+          note: itemNotes[item.id]?.trim() || null,
         });
         if (insertErr) throw insertErr;
       }
@@ -820,15 +825,44 @@ async function handleAction(
             if (deleteErr) throw deleteErr;
             removeNeeded -= row.qty;
           } else {
+            const nextQty = row.qty - removeNeeded;
             const { error: updateErr } = await supabase
               .from("order_items")
-              .update({ qty: row.qty - removeNeeded })
+              .update({
+                qty: nextQty,
+                printed_qty: Math.min(row.printed_qty ?? 0, nextQty),
+              })
               .eq("id", row.id);
             if (updateErr) throw updateErr;
             removeNeeded = 0;
           }
         }
       }
+    }
+  }
+
+  async function updateNoteAndPersist(itemId: string, note: string) {
+    if (!orderModalFor) return;
+
+    setItemNotes((prev) => ({
+      ...prev,
+      [itemId]: note,
+    }));
+
+    try {
+      const orderId = await getOrCreateOpenOrder(orderModalFor.id);
+      orderTableCacheRef.current[orderId] = orderModalFor.id;
+
+      const { error } = await supabase
+        .from("order_items")
+        .update({ note: note.trim() || null })
+        .eq("order_id", orderId)
+        .eq("item_id", itemId);
+
+      if (error) throw error;
+    } catch (error) {
+      console.error("Could not save item note:", error);
+      alert("Notiz konnte nicht gespeichert werden.");
     }
   }
 
@@ -891,11 +925,28 @@ async function handleAction(
         cache[row.id] = row;
       });
       setItemCache(cache);
+
+      const orderId = await getOrCreateOpenOrder(tableId);
+      orderTableCacheRef.current[orderId] = tableId;
+
+      const { data: noteRows, error: noteError } = await supabase
+        .from("order_items")
+        .select("item_id, note")
+        .eq("order_id", orderId);
+
+      if (noteError) throw noteError;
+
+      const notes: Record<string, string> = {};
+      (noteRows ?? []).forEach((row: any) => {
+        if (row.note) notes[row.item_id] = row.note;
+      });
+      setItemNotes(notes);
     } catch (err) {
       console.error(err);
       setBasket({});
       setLoadedBasket({});
       setItemCache({});
+      setItemNotes({});
     }
   }
 
@@ -903,11 +954,156 @@ async function handleAction(
 
   function closeOrderModal() {
     setOrderModalFor(null);
+    setMoveTargetTableId("");
     setBasket({});
     setLoadedBasket({});
     setItemCache({});
+    setItemNotes({});
     setPlu("");
     setPluQty(1);
+  }
+
+  async function moveOpenOrderToTable(targetTableId: string) {
+    if (!orderModalFor) return;
+
+    const sourceTableId = orderModalFor.id;
+    if (!targetTableId || targetTableId === sourceTableId) return;
+
+    const targetTable = localTables.find((table) => table.id === targetTableId);
+    if (!targetTable) {
+      alert("Zieltisch nicht gefunden.");
+      return;
+    }
+
+    if (targetTable.status !== "FREE") {
+      alert("Umbuchen ist nur auf einen freien Tisch möglich.");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Bestellung von ${sourceTableId} auf ${targetTableId} umbuchen?`
+    );
+    if (!confirmed) return;
+
+    try {
+      const { data: sourceOrders, error: sourceError } = await supabase
+        .from("orders")
+        .select("id")
+        .eq("table_id", sourceTableId)
+        .eq("status", "OPEN")
+        .limit(1);
+
+      if (sourceError) throw sourceError;
+
+      const orderId = sourceOrders?.[0]?.id as string | undefined;
+      if (!orderId) {
+        alert("Keine offene Bestellung zum Umbuchen gefunden.");
+        return;
+      }
+
+      const { data: targetOrders, error: targetOrderError } = await supabase
+        .from("orders")
+        .select("id")
+        .eq("table_id", targetTableId)
+        .eq("status", "OPEN")
+        .limit(1);
+
+      if (targetOrderError) throw targetOrderError;
+
+      if ((targetOrders ?? []).length > 0) {
+        alert("Auf dem Zieltisch gibt es bereits eine offene Bestellung. Zusammenführen bauen wir später.");
+        return;
+      }
+
+      const now = Date.now();
+
+      const { error: orderUpdateError } = await supabase
+        .from("orders")
+        .update({ table_id: targetTableId })
+        .eq("id", orderId)
+        .eq("status", "OPEN");
+
+      if (orderUpdateError) throw orderUpdateError;
+
+      const { error: targetUpdateError } = await supabase
+        .from("tables")
+        .update({
+          status: "SEATED",
+          since: toISO(now),
+          name: orderModalFor.name ?? null,
+          party_size: orderModalFor.partySize ?? null,
+          reserved_for: null,
+          note: orderModalFor.note ?? null,
+        })
+        .eq("id", targetTableId);
+
+      if (targetUpdateError) throw targetUpdateError;
+
+      const { error: sourceUpdateError } = await supabase
+        .from("tables")
+        .update({
+          status: "DIRTY",
+          since: toISO(now),
+          name: null,
+          party_size: null,
+          reserved_for: null,
+          note: `Umgesetzt auf ${targetTableId}`,
+        })
+        .eq("id", sourceTableId);
+
+      if (sourceUpdateError) throw sourceUpdateError;
+
+      orderTableCacheRef.current[orderId] = targetTableId;
+
+      setLocalTables((prev) =>
+        prev.map((table) => {
+          if (table.id === targetTableId) {
+            return {
+              ...table,
+              status: "SEATED",
+              since: now,
+              name: orderModalFor.name,
+              partySize: orderModalFor.partySize,
+              reservedFor: null,
+              note: orderModalFor.note ?? null,
+            };
+          }
+
+          if (table.id === sourceTableId) {
+            return {
+              ...table,
+              status: "DIRTY",
+              since: now,
+              name: undefined,
+              partySize: undefined,
+              reservedFor: null,
+              note: `Umgesetzt auf ${targetTableId}`,
+            };
+          }
+
+          return table;
+        })
+      );
+
+      await refreshTotals([sourceTableId, targetTableId]);
+
+      const movedTable = {
+        ...targetTable,
+        status: "SEATED" as TableStatus,
+        since: now,
+        name: orderModalFor.name,
+        partySize: orderModalFor.partySize,
+        reservedFor: null,
+        note: orderModalFor.note ?? null,
+      };
+
+      setOrderModalFor(movedTable);
+      setMoveTargetTableId("");
+      await loadOpenOrderIntoModal(targetTableId);
+    } catch (error) {
+      console.error("Move order failed:", error);
+      alert("Bestellung konnte nicht umgebucht werden.");
+    }
   }
 
   async function handleCheckout() {
@@ -952,7 +1148,14 @@ async function handleAction(
 
   async function printKitchenItems(
     tableLabel: string,
-    items: Array<{ name: string; qty: number; category?: string }>
+    items: Array<{
+      name: string;
+      qty: number;
+      category?: string | null;
+      plu?: string | null;
+      kitchen_label?: string | null;
+      note?: string | null;
+    }>
   ) {
     try {
       await fetch("/api/print", {
@@ -962,6 +1165,7 @@ async function handleAction(
         },
         body: JSON.stringify({
           table: tableLabel,
+          userName: currentUsername,
           items,
         }),
       });
@@ -973,25 +1177,127 @@ async function handleAction(
   async function printCurrentKitchenBon() {
     if (!orderModalFor) return;
 
-    const printableItems = Object.entries(basket)
-      .map(([itemId, qty]) => {
-        const item = itemCache[itemId];
-        if (!item || qty <= 0) return null;
+    try {
+      const orderId = await getOrCreateOpenOrder(orderModalFor.id);
+      orderTableCacheRef.current[orderId] = orderModalFor.id;
 
-        return {
+      await syncBasketToOrder(orderId, basket);
+
+      const { data: orderRows, error } = await supabase
+        .from("order_items")
+        .select("id, item_id, qty, printed_qty, note")
+        .eq("order_id", orderId);
+
+      if (error) throw error;
+
+      const rows = (orderRows ?? []) as Array<{
+        id: string;
+        item_id: string;
+        qty: number;
+        printed_qty: number | null;
+        note: string | null;
+      }>;
+
+      const rowsToPrint = rows
+        .map((row) => ({
+          ...row,
+          deltaQty: row.qty - (row.printed_qty ?? 0),
+        }))
+        .filter((row) => row.deltaQty > 0);
+
+      if (rowsToPrint.length === 0) {
+        alert("Keine neue Nachbestellung zum Drucken.");
+        return;
+      }
+
+      const itemIds = Array.from(new Set(rowsToPrint.map((row) => row.item_id)));
+
+      const menuById = new Map<string, MenuItem & { kitchen_label?: string | null }>();
+
+      menu.forEach((item) => {
+        if (itemIds.includes(item.id)) {
+          menuById.set(item.id, item);
+        }
+      });
+
+      Object.values(itemCache).forEach((item) => {
+        if (itemIds.includes(item.id)) {
+          menuById.set(item.id, item);
+        }
+      });
+
+      const missingItemIds = itemIds.filter((itemId) => !menuById.has(itemId));
+
+      if (missingItemIds.length > 0) {
+        const { data: menuRows, error: menuError } = await supabase
+          .from("menu_items")
+          .select("id, name, category, plu, kitchen_label")
+          .in("id", missingItemIds);
+
+        if (menuError) throw menuError;
+
+        (menuRows ?? []).forEach((item: any) => {
+          menuById.set(item.id as string, item as MenuItem);
+        });
+      }
+
+      const mergedByItemId = new Map<
+        string,
+        {
+          name: string;
+          qty: number;
+          category?: string | null;
+          plu?: string | null;
+          kitchen_label?: string | null;
+          note?: string | null;
+        }
+      >();
+
+      rowsToPrint.forEach((row) => {
+        const item = menuById.get(row.item_id);
+        if (!item) return;
+
+        const existing = mergedByItemId.get(row.item_id);
+        if (existing) {
+          existing.qty += row.deltaQty;
+          if (row.note && !existing.note) existing.note = row.note;
+          return;
+        }
+
+        mergedByItemId.set(row.item_id, {
           name: item.name,
-          qty,
+          qty: row.deltaQty,
           category: item.category,
-        };
-      })
-      .filter(Boolean) as Array<{ name: string; qty: number; category?: string }>;
+          plu: item.plu,
+          kitchen_label: item.kitchen_label,
+          note: row.note,
+        });
+      });
 
-    if (printableItems.length === 0) {
-      alert("Keine Artikel zum Drucken.");
-      return;
+      const printableItems = Array.from(mergedByItemId.values());
+
+      if (printableItems.length === 0) {
+        alert("Keine druckbaren Artikel gefunden.");
+        return;
+      }
+
+      await printKitchenItems(orderModalFor.id, printableItems);
+
+      await Promise.all(
+        rowsToPrint.map((row) =>
+          supabase
+            .from("order_items")
+            .update({ printed_qty: row.qty })
+            .eq("id", row.id)
+        )
+      );
+
+      await loadOpenOrderIntoModal(orderModalFor.id);
+      await refreshTotals([orderModalFor.id]);
+    } catch (error) {
+      console.error("Kitchen print failed:", error);
+      alert("Bon konnte nicht gedruckt werden.");
     }
-
-    await printKitchenItems(orderModalFor.id, printableItems);
   }
 
   /* =========================
@@ -1113,8 +1419,13 @@ async function handleAction(
         <OrderModal
           orderModalFor={orderModalFor}
           basket={basket}
+          itemNotes={itemNotes}
           itemCache={itemCache}
           menu={menu}
+          tables={tables}
+          moveTargetTableId={moveTargetTableId}
+          setMoveTargetTableId={setMoveTargetTableId}
+          onMoveOrder={moveOpenOrderToTable}
           plu={plu}
           pluQty={pluQty}
           pluInputRef={pluInputRef}
@@ -1122,6 +1433,7 @@ async function handleAction(
           setPluQty={setPluQty}
           addPluToBasket={addPluToBasket}
           updateQtyAndPersist={updateQtyAndPersist}
+          updateNoteAndPersist={updateNoteAndPersist}
           onClose={closeOrderModal}
           onCheckout={handleCheckout}
           onPrintKitchenBon={printCurrentKitchenBon}

@@ -34,7 +34,7 @@ export default function LoginPage() {
   return (
     <div className="flex items-center justify-center h-screen">
       <div className="p-6 border rounded-xl space-y-3">
-        <h1 className="text-xl font-bold">Admin Login</h1>
+        <h1 className="text-xl font-bold">Taki-Taki Login</h1>
 
         <input
           className="border p-2 w-full"
