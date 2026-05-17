@@ -1,5 +1,5 @@
 "use client";
-import React, { useMemo, useState, useEffect, useRef } from "react";
+import React, { useMemo, useState, useEffect, useRef, useCallback } from "react";
 import { createClient as createSupabaseClient } from "@/lib/supabase/client";
 import { toISO, cls } from "@/utils/tableHelpers";
 import {
@@ -226,7 +226,7 @@ useEffect(() => {
   return () => window.clearTimeout(timer);
 }, [orderModalFor]);
 const orderTableCacheRef = useRef<Record<string, string>>({});
-const supabase = createSupabaseClient();
+const supabase = useMemo(() => createSupabaseClient(), []);
 useEffect(() => {
   (async () => {
     const {
@@ -310,7 +310,7 @@ orderTableCacheRef.current[orderId] = orderModalFor.id;
   }
 }
 
-async function refreshTotalForTable(tableId: string) {
+const refreshTotalForTable = useCallback(async (tableId: string) => {
   if (!tableId) return;
 
   const { data: ords } = await supabase
@@ -342,15 +342,15 @@ async function refreshTotalForTable(tableId: string) {
     ...prev,
     [tableId]: total,
   }));
-}
+}, [supabase]);
 
-async function refreshTotals(tableIds: string[]) {
+const refreshTotals = useCallback(async (tableIds: string[]) => {
   const uniqueIds = Array.from(new Set(tableIds)).filter(Boolean);
   if (!uniqueIds.length) return;
   await Promise.all(uniqueIds.map((tableId) => refreshTotalForTable(tableId)));
-}
+}, [refreshTotalForTable]);
 
-async function resolveTableIdForOrder(orderId: string) {
+const resolveTableIdForOrder = useCallback(async (orderId: string) => {
   const cached = orderTableCacheRef.current[orderId];
   if (cached) return cached;
 
@@ -365,7 +365,7 @@ async function resolveTableIdForOrder(orderId: string) {
     orderTableCacheRef.current[orderId] = tableId;
   }
   return tableId;
-}
+}, [supabase]);
 
 useEffect(() => {
   const ids = (localTables ?? []).map((t) => t.id);
@@ -630,7 +630,7 @@ useEffect(() => {
         query ? `${t.id} ${t.name ?? ""}`.toLowerCase().includes(query.toLowerCase()) : true
       )
       .sort((a, b) => compareTableIds(a.id, b.id));
-  }, [tables, query, tick]);
+  }, [tables, query]);
 
   const totals = useMemo(() => {
     const res: Record<string, number> = { ALL: tables.length };
@@ -1158,7 +1158,7 @@ async function handleAction(
     }>
   ) {
     try {
-      await fetch("/api/print", {
+      void fetch("/api/print", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1292,7 +1292,6 @@ async function handleAction(
         )
       );
 
-      await loadOpenOrderIntoModal(orderModalFor.id);
       await refreshTotals([orderModalFor.id]);
     } catch (error) {
       console.error("Kitchen print failed:", error);
@@ -1449,4 +1448,4 @@ async function handleAction(
       )}
     </div>
   );
-} 
+}
