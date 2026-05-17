@@ -226,6 +226,7 @@ useEffect(() => {
   return () => window.clearTimeout(timer);
 }, [orderModalFor]);
 const orderTableCacheRef = useRef<Record<string, string>>({});
+const noteSaveTimersRef = useRef<Record<string, number>>({});
 const supabase = useMemo(() => createSupabaseClient(), []);
 useEffect(() => {
   (async () => {
@@ -300,9 +301,8 @@ async function updateQtyAndPersist(itemId: string, q: number) {
 
   try {
     const orderId = await getOrCreateOpenOrder(orderModalFor.id);
-orderTableCacheRef.current[orderId] = orderModalFor.id;
+    orderTableCacheRef.current[orderId] = orderModalFor.id;
     await syncBasketToOrder(orderId, nextBasket);
-    await loadOpenOrderIntoModal(orderModalFor.id);
     await refreshTotals([orderModalFor.id]);
   } catch (e) {
     console.error(e);
@@ -849,21 +849,26 @@ async function handleAction(
       [itemId]: note,
     }));
 
-    try {
-      const orderId = await getOrCreateOpenOrder(orderModalFor.id);
-      orderTableCacheRef.current[orderId] = orderModalFor.id;
+    window.clearTimeout(noteSaveTimersRef.current[itemId]);
 
-      const { error } = await supabase
-        .from("order_items")
-        .update({ note: note.trim() || null })
-        .eq("order_id", orderId)
-        .eq("item_id", itemId);
+    noteSaveTimersRef.current[itemId] = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const orderId = await getOrCreateOpenOrder(orderModalFor.id);
+          orderTableCacheRef.current[orderId] = orderModalFor.id;
 
-      if (error) throw error;
-    } catch (error) {
-      console.error("Could not save item note:", error);
-      alert("Notiz konnte nicht gespeichert werden.");
-    }
+          const { error } = await supabase
+            .from("order_items")
+            .update({ note: note.trim() || null })
+            .eq("order_id", orderId)
+            .eq("item_id", itemId);
+
+          if (error) throw error;
+        } catch (error) {
+          console.error("Could not save item note:", error);
+        }
+      })();
+    }, 500);
   }
 
   async function addPluToBasket() {
@@ -874,19 +879,25 @@ async function handleAction(
 
     if (!code) return;
 
-    const { data, error } = await supabase
-      .from("menu_items")
-      .select("*")
-      .eq("plu", code)
-      .eq("active", true)
-      .single();
+    let item =
+      menu.find((m) => String(m.plu ?? "").trim() === code && m.active) ||
+      Object.values(itemCache).find((m) => String(m.plu ?? "").trim() === code && m.active);
 
-    if (error || !data) {
-      alert("PLU nicht gefunden oder inaktiv.");
-      return;
+    if (!item) {
+      const { data, error } = await supabase
+        .from("menu_items")
+        .select("*")
+        .eq("plu", code)
+        .eq("active", true)
+        .single();
+
+      if (error || !data) {
+        alert("PLU nicht gefunden oder inaktiv.");
+        return;
+      }
+
+      item = data as MenuItem;
     }
-
-    const item = data as MenuItem;
 
     const nextBasket = {
       ...basket,
@@ -903,7 +914,6 @@ async function handleAction(
       const orderId = await getOrCreateOpenOrder(orderModalFor.id);
       orderTableCacheRef.current[orderId] = orderModalFor.id;
       await syncBasketToOrder(orderId, nextBasket);
-      await loadOpenOrderIntoModal(orderModalFor.id);
       setPlu("");
       setPluQty(1);
       await refreshTotals([orderModalFor.id]);
